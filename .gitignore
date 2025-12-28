@@ -1,0 +1,11 @@
+**/__pycache__/
+**/*.pyc
+test/
+*.pkl
+**/wandb/
+**/wandb_tables_cache/
+**/cache/
+experiments/results/
+experiments/figures/
+experiments/output/
+visualize.ipynb
