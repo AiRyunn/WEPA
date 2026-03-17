@@ -9,22 +9,46 @@ Run the following commands to create a conda environment and install the require
 
 ```bash
 conda create -n wepa python=3.12 -y && conda activate wepa
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Running Experiments
 
 ### Option 1: Jupyter Notebooks
 
-Navigate to the `experiments/` directory and run the notebooks to reproduce results from the paper.
+Notebooks live in `notebooks/` and are intended for manual exploration. Each notebook loads its own config from `experiments/configs/<experiment>.yaml`, prints it, and calls the corresponding runner in `experiments/runs/`.
 
-### Option 2: Python Scripts
+### Option 2: Bash Scripts
 
-Alternatively, execute the scripts in the `scripts/` directory directly from the command line.
+Execute the bash scripts in the `scripts/` directory directly from the command line.
 
 ```
-python scripts/<script_name>.py
+./scripts/<experiment>.sh
 ```
+
+For translation, you can also launch 8 shard workers in parallel, one per GPU:
+
+```bash
+./scripts/translation_8gpu.sh
+```
+
+The CLI now accepts config paths only:
+
+```bash
+python -m experiments.run --config experiments/configs/ppl.yaml
+```
+
+Configs live in `experiments/configs/`.
+
+## Layout
+
+- `src/watermarker/`: canonical package code
+- `experiments/runs/`: runnable experiment runners
+- `experiments/configs/`: per-experiment YAML configs
+- `notebooks/`: manual notebooks (thin wrappers around scripts)
+- `scripts/`: bash scripts for common runs
+- `tests/`: automated validation
+- `artifacts/`: generated outputs, caches, and WandB runs
 
 ## Citation
 

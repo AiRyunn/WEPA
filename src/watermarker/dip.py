@@ -1,383 +1,232 @@
-# Copyright 2024 THU-BPM MarkLLM.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# ================================================
-# dip.py
-# Description: Implementation of DiPmark algorithm
-# ================================================
-
 import hashlib
-import random
+import math
 from functools import partial
-from math import sqrt
-from typing import Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from exceptions.exceptions import AlgorithmNameMismatchError
 from transformers import LogitsProcessor, LogitsProcessorList
-from utils.transformers_config import TransformersConfig
-from utils.utils import load_config_file
-from visualize.data_for_visualization import DataForVisualization
 
 
-class BaseConfig:
-    """Base configuration class for watermark algorithms."""
+class DIPConfig:
+    def __init__(
+        self,
+        vocab_size: int,
+        device: torch.device = torch.device("cpu"),
+        alpha: float = 0.5,
+        gamma: float = 0.5,
+        hash_key: bytes | str | int = b"42",
+        prefix_length: int = 5,
+        ignore_history_generation: bool = False,
+        ignore_history_detection: bool = False,
+        z_threshold: float = 4.0,
+    ) -> None:
+        self.vocab_size = vocab_size
+        self.device = device
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.prefix_length = int(prefix_length)
+        self.ignore_history_generation = bool(ignore_history_generation)
+        self.ignore_history_detection = bool(ignore_history_detection)
+        self.z_threshold = float(z_threshold)
 
-    def __init__(self, algorithm_config_path: str, transformers_config: TransformersConfig, *args, **kwargs) -> None:
-        """
-        Initialize the base configuration.
+        if isinstance(hash_key, bytes):
+            self.hash_key = hash_key
+        else:
+            self.hash_key = str(hash_key).encode("utf-8")
 
-        Parameters:
-            algorithm_config (str): Path to the algorithm configuration file.
-            transformers_config (TransformersConfig): Configuration for the transformers model.
-            **kwargs: Additional parameters to override config values
-        """
-        # Load config file
-        self.config_dict = load_config_file(f'config/{self.algorithm_name()}.json') if algorithm_config_path is None else load_config_file(algorithm_config_path)
-
-        # Update config with kwargs
-        if kwargs:
-            self.config_dict.update(kwargs)
-
-        # Load model-related configurations
-        self.generation_model = transformers_config.model
-        self.generation_tokenizer = transformers_config.tokenizer
-        self.vocab_size = transformers_config.vocab_size
-        self.device = transformers_config.device
-        self.gen_kwargs = transformers_config.gen_kwargs
-        self.transformers_config = transformers_config
-
-        # Initialize algorithm-specific parameters
-        self.initialize_parameters()
-
-    def initialize_parameters(self) -> None:
-        """Initialize algorithm-specific parameters. Should be overridden by subclasses."""
-        raise NotImplementedError
-
-    @property
-    def algorithm_name(self) -> str:
-        """Return the algorithm name. Should be overridden by subclasses."""
-        raise NotImplementedError
-
-
-
-class BaseWatermark:
-    def __init__(self, algorithm_config: str | BaseConfig, transformers_config: TransformersConfig, *args, **kwargs) -> None:
-        pass
-
-    def generate(self, prompt: str, *args, **kwargs) -> str:
-        pass
-
-    def generate_unwatermarked_text(self, prompt: str, *args, **kwargs) -> str:
-        """Generate unwatermarked text."""
-
-        # Encode prompt
-        encoded_prompt = self.config.generation_tokenizer(prompt, return_tensors="pt", add_special_tokens=True).to(self.config.device)
-        # Generate unwatermarked text
-        encoded_unwatermarked_text = self.config.generation_model.generate(**encoded_prompt, **self.config.gen_kwargs)
-        # Decode
-        unwatermarked_text = self.config.generation_tokenizer.batch_decode(encoded_unwatermarked_text, skip_special_tokens=True)[0]
-        return unwatermarked_text
-
-    def p_value(self, text:str, return_dict: bool=True, *args, **kwargs) -> Union[tuple, dict]:
-        pass
-
-    def get_data_for_visualize(self, text, *args, **kwargs) -> DataForVisualization:
-        pass
-
-class DIPConfig(BaseConfig):
-    """Config class for DiP algorithm, load config file and initialize parameters."""
-
-    def initialize_parameters(self) -> None:
-        """Initialize algorithm-specific parameters."""
-        self.gamma = self.config_dict['gamma']
-        self.alpha = self.config_dict['alpha']
-        self.ignore_history_generation = bool(self.config_dict['ignore_history_generation'])
-        self.ignore_history_detection = bool(self.config_dict['ignore_history_detection'])
-        self.z_threshold = self.config_dict['z_threshold']
-        self.prefix_length = self.config_dict['prefix_length']
-
-    @property
-    def algorithm_name(self) -> str:
-        """Return the algorithm name."""
-        return 'DIP'
 
 class DIPUtils:
-    """Utility class for DiP algorithm, contains helper functions."""
-
-    def __init__(self, config: DIPConfig, *args, **kwargs) -> None:
-        """
-            Initialize the DIP utility class.
-
-            Parameters:
-                config (DIPConfig): Configuration for the DiP algorithm.
-        """
+    def __init__(self, config: DIPConfig) -> None:
         self.config = config
-        self.rng = torch.Generator(device=self.config.device)
         self.cc_history = set()
-        self.state_indicator = 0 # 0 for generation, 1 for detection and visualization
+        self.state_indicator = 0  # 0 for generation, 1 for detection
 
-
-    def _get_rng_seed(self, context_code: any) -> int:
-        """Get the random seed from the given context code and private key."""
+    def _get_rng_seed(self, context_code: bytes) -> int:
         if (
-            (not self.config.ignore_history_generation and self.state_indicator == 0) or
-            (not self.config.ignore_history_detection and self.state_indicator == 1)
+            (not self.config.ignore_history_generation and self.state_indicator == 0)
+            or (not self.config.ignore_history_detection and self.state_indicator == 1)
         ):
             self.cc_history.add(context_code)
 
-        m = hashlib.sha256()
-        m.update(context_code)
-        m.update(self.config.hash_key)
-
-        full_hash = m.digest()
-        seed = int.from_bytes(full_hash, "big") % (2**32 - 1)
-        return seed
+        hasher = hashlib.sha256()
+        hasher.update(context_code)
+        hasher.update(self.config.hash_key)
+        full_hash = hasher.digest()
+        return int.from_bytes(full_hash, "big") % (2**32 - 1)
 
     def _extract_context_code(self, context: torch.LongTensor) -> bytes:
-        """Extract context code from the given context."""
         if self.config.prefix_length == 0:
             return context.detach().cpu().numpy().tobytes()
-        else:
-            return context[-self.config.prefix_length : ].detach().cpu().numpy().tobytes()
+        return context[-self.config.prefix_length :].detach().cpu().numpy().tobytes()
 
-    def from_random(self, rng: Union[torch.Generator, list[torch.Generator]], vocab_size: int) -> torch.LongTensor:
-        """Generate a permutation from the random number generator."""
+    def from_random(
+        self,
+        rng: torch.Generator | list[torch.Generator],
+        vocab_size: int,
+        device: torch.device,
+    ) -> torch.LongTensor:
         if isinstance(rng, list):
-            batch_size = len(rng)
-            shuffle = torch.stack(
-                [
-                    torch.randperm(vocab_size, generator=rng[i], device=rng[i].device)
-                    for i in range(batch_size)
-                ]
+            return torch.stack(
+                [torch.randperm(vocab_size, generator=generator, device=device) for generator in rng]
             )
-        else:
-            shuffle = torch.randperm(vocab_size, generator=rng, device=rng.device)
-        return shuffle
+        return torch.randperm(vocab_size, generator=rng, device=device)
 
-    def reweight_logits(self, shuffle: torch.LongTensor, p_logits: torch.FloatTensor) -> torch.FloatTensor:
-        """Reweight the logits using the shuffle and alpha."""
+    def reweight_logits(
+        self,
+        shuffle: torch.LongTensor,
+        p_logits: torch.FloatTensor,
+    ) -> torch.FloatTensor:
         unshuffle = torch.argsort(shuffle, dim=-1)
 
         s_p_logits = torch.gather(p_logits, -1, shuffle)
         s_log_cumsum = torch.logcumsumexp(s_p_logits, dim=-1)
-
-        # normalize the log_cumsum to force the last element to be 0
         s_log_cumsum = s_log_cumsum - s_log_cumsum[..., -1:]
         s_cumsum = torch.exp(s_log_cumsum)
         s_p = F.softmax(s_p_logits, dim=-1)
 
-        boundary_1 = torch.argmax((s_cumsum > self.config.alpha).to(torch.int), dim=-1, keepdim=True)
+        boundary_1 = torch.argmax(
+            (s_cumsum > self.config.alpha).to(torch.int64),
+            dim=-1,
+            keepdim=True,
+        )
         p_boundary_1 = torch.gather(s_p, -1, boundary_1)
-        portion_in_right_1 = (torch.gather(s_cumsum, -1, boundary_1) - self.config.alpha) / p_boundary_1
+        portion_in_right_1 = (
+            torch.gather(s_cumsum, -1, boundary_1) - self.config.alpha
+        ) / p_boundary_1
         portion_in_right_1 = torch.clamp(portion_in_right_1, 0, 1)
         s_all_portion_in_right_1 = (s_cumsum > self.config.alpha).type_as(p_logits)
         s_all_portion_in_right_1.scatter_(-1, boundary_1, portion_in_right_1)
 
-        boundary_2 = torch.argmax((s_cumsum > (1-self.config.alpha)).to(torch.int), dim=-1, keepdim=True)
+        boundary_2 = torch.argmax(
+            (s_cumsum > (1 - self.config.alpha)).to(torch.int64),
+            dim=-1,
+            keepdim=True,
+        )
         p_boundary_2 = torch.gather(s_p, -1, boundary_2)
-        portion_in_right_2 = (torch.gather(s_cumsum, -1, boundary_2) - (1-self.config.alpha)) / p_boundary_2
+        portion_in_right_2 = (
+            torch.gather(s_cumsum, -1, boundary_2) - (1 - self.config.alpha)
+        ) / p_boundary_2
         portion_in_right_2 = torch.clamp(portion_in_right_2, 0, 1)
-        s_all_portion_in_right_2 = (s_cumsum > (1-self.config.alpha)).type_as(p_logits)
+        s_all_portion_in_right_2 = (s_cumsum > (1 - self.config.alpha)).type_as(p_logits)
         s_all_portion_in_right_2.scatter_(-1, boundary_2, portion_in_right_2)
 
-        s_all_portion_in_right = s_all_portion_in_right_2/2 + s_all_portion_in_right_1/2
-        s_shift_logits = torch.log(s_all_portion_in_right)
-        shift_logits = torch.gather(s_shift_logits, -1, unshuffle)
+        s_all_portion_in_right = s_all_portion_in_right_2 / 2 + s_all_portion_in_right_1 / 2
+        shift_logits = torch.log(torch.clamp(s_all_portion_in_right, min=1e-20))
+        return p_logits + torch.gather(shift_logits, -1, unshuffle)
 
-        return p_logits + shift_logits
-
-    def get_seed_for_cipher(self, input_ids: torch.LongTensor) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        """Get the mask and seeds for the cipher."""
-        batch_size = input_ids.size(0)
-        context_codes = [
-            self._extract_context_code(input_ids[i]) for i in range(batch_size)
+    def get_seed_for_cipher(self, input_ids: torch.LongTensor) -> tuple[list[bool], list[int]]:
+        context_codes = [self._extract_context_code(input_ids[i]) for i in range(input_ids.size(0))]
+        mask_and_seeds = [
+            (context_code in self.cc_history, self._get_rng_seed(context_code))
+            for context_code in context_codes
         ]
+        mask, seeds = zip(*mask_and_seeds)
+        return list(mask), list(seeds)
 
-        mask, seeds = zip(
-            *[
-                (context_code in self.cc_history, self._get_rng_seed(context_code))
-                for context_code in context_codes
-            ]
-        )
-
-        return mask, seeds
-
-    def _get_green_token_quantile(self, input_ids: torch.LongTensor, vocab_size, current_token):
-        """Get the vocab quantile of current token"""
+    def _get_green_token_quantile(
+        self,
+        input_ids: torch.LongTensor,
+        current_token: torch.LongTensor,
+    ) -> tuple[torch.Tensor, bool]:
         mask, seeds = self.get_seed_for_cipher(input_ids.unsqueeze(0))
+        rng = [torch.Generator(device=input_ids.device).manual_seed(seed) for seed in seeds]
+        shuffle = self.from_random(rng, self.config.vocab_size, input_ids.device)
+        token_quantile = (torch.where(shuffle[0] == current_token)[0] + 1) / self.config.vocab_size
+        return token_quantile.reshape(-1)[0], mask[0]
 
-        rng = [
-            torch.Generator(device=input_ids.device).manual_seed(seed) for seed in seeds
-        ]
-
-        mask = torch.tensor(mask, device=input_ids.device)
-        shuffle = self.from_random(
-            rng, vocab_size
-        )
-
-        token_quantile = [(torch.where(shuffle[0] == current_token)[0] +1)/vocab_size]
-        return token_quantile, mask
-
-    def _get_dip_score(self, input_ids: torch.LongTensor, vocab_size):
-        """Get the DiP score of the input_ids"""
-        scores = torch.zeros(input_ids.shape, device=input_ids.device)
+    def _get_dip_score(self, input_ids: torch.LongTensor) -> torch.Tensor:
+        scores = torch.zeros(input_ids.shape, dtype=torch.float32, device=input_ids.device)
 
         for i in range(input_ids.shape[-1] - 1):
-            pre = input_ids[ : i+1]
-            cur = input_ids[i+1]
-            token_quantile, mask = self._get_green_token_quantile(pre, vocab_size, cur)
-            # if the current token is in the history and ignore_history_detection is False, set the score to -1
-            if not self.config.ignore_history_detection and mask[0]:
+            prefix = input_ids[: i + 1]
+            current_token = input_ids[i + 1]
+            token_quantile, masked = self._get_green_token_quantile(prefix, current_token)
+            if not self.config.ignore_history_detection and masked:
                 scores[i + 1] = -1
             else:
-                scores[i + 1] = torch.stack(token_quantile).reshape(-1)
+                scores[i + 1] = token_quantile
 
         return scores
 
     def score_sequence(self, input_ids: torch.LongTensor) -> tuple[float, list[int]]:
-        """Score the input_ids and return z_score and green_token_flags."""
-        score = self._get_dip_score(input_ids, self.config.vocab_size)
+        scores = self._get_dip_score(input_ids)
+        green_token_flags = torch.zeros_like(scores, dtype=torch.long)
 
-        green_tokens = torch.sum(score >= self.config.gamma, dim=-1, keepdim=False)
-        green_token_flags = torch.zeros_like(score)
-        condition_indices = torch.nonzero(score >= self.config.gamma, as_tuple=False).reshape(-1)
-        green_token_flags[condition_indices] = 1
-        green_token_flags[:self.config.prefix_length] = -1
+        valid_mask = scores >= 0
+        green_mask = scores >= self.config.gamma
+        green_token_flags[green_mask] = 1
+        green_token_flags[: self.config.prefix_length] = -1
+        green_token_flags[~valid_mask] = -1
 
-        # Use two different ways to calculate z_score depending on whether to ignore history
-        if not self.config.ignore_history_detection:
-            ignored_indices = torch.nonzero(score == -1, as_tuple=False).reshape(-1)
+        valid_count = int(valid_mask.sum().item())
+        if valid_count == 0:
+            return 0.0, green_token_flags.tolist()
 
-            # Visualize the ignored tokens as ignored
-            green_token_flags[ignored_indices] = -1
+        green_tokens = int(green_mask.sum().item())
+        expected_green = (1 - self.config.gamma) * valid_count
+        z_score = (green_tokens - expected_green) / math.sqrt(valid_count)
+        return float(z_score), green_token_flags.tolist()
 
-            # Calculate z_score using the sequence length after ignoring the ignored tokens
-            sequence_length_for_calculation = input_ids.size(-1) - ignored_indices.size(0)
-            z_score = (green_tokens - (1-self.config.gamma) * sequence_length_for_calculation) / sqrt(sequence_length_for_calculation)
-        else:
-            z_score = (green_tokens - (1-self.config.gamma) * input_ids.size(-1)) / sqrt(input_ids.size(-1))
-
-        return z_score.item(), green_token_flags.tolist()
 
 class DIPLogitsProcessor(LogitsProcessor):
-    """LogitsProcessor for DiP algorithm, process logits to add watermark."""
-
-    def __init__(self, config: DIPConfig, utils: DIPUtils, *args, **kwargs) -> None:
-        """
-            Initialize the DIP logits processor.
-
-            Parameters:
-                config (DIPConfig): Configuration for the DiP algorithm.
-                utils (DIPUtils): Utility class for the DiP algorithm.
-        """
+    def __init__(self, config: DIPConfig, utils: DIPUtils) -> None:
         self.config = config
         self.utils = utils
 
-    def _apply_watermark(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        """Apply watermark to the scores."""
+    def _apply_watermark(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+    ) -> tuple[torch.Tensor, torch.FloatTensor]:
         mask, seeds = self.utils.get_seed_for_cipher(input_ids)
-
-        rng = [
-            torch.Generator(device=scores.device).manual_seed(seed) for seed in seeds
-        ]
-        mask = torch.tensor(mask, device=scores.device)
-        shuffle = self.utils.from_random(
-            rng, scores.size(1)
-        )
-
+        rng = [torch.Generator(device=scores.device).manual_seed(seed) for seed in seeds]
+        shuffle = self.utils.from_random(rng, scores.size(1), scores.device)
         reweighted_scores = self.utils.reweight_logits(shuffle, scores)
-
-        return mask, reweighted_scores
+        return torch.tensor(mask, device=scores.device), reweighted_scores
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        """Process logits to add watermark."""
         if input_ids.shape[-1] < self.config.prefix_length:
             return scores
 
         mask, reweighted_scores = self._apply_watermark(input_ids, scores)
-
         if self.config.ignore_history_generation:
             return reweighted_scores
-        else:
-            return torch.where(mask[:, None], scores, reweighted_scores)
+        return torch.where(mask[:, None], scores, reweighted_scores)
 
 
-class DIP(BaseWatermark):
-    """Top-level class for DIP algorithm."""
+class DipWatermarker:
+    def __init__(self, config: DIPConfig) -> None:
+        self.config = config
+        self.utils = DIPUtils(config)
+        self.logits_processor = DIPLogitsProcessor(config, self.utils)
 
-    def __init__(self, algorithm_config: str | DIPConfig, transformers_config: TransformersConfig | None = None, *args, **kwargs) -> None:
-        """
-            Initialize the DIP algorithm.
-
-            Parameters:
-                algorithm_config (str | DIPConfig): Path to the algorithm configuration file or DIPConfig instance.
-                transformers_config (TransformersConfig): Configuration for the transformers model.
-        """
-        if isinstance(algorithm_config, str):
-            self.config = DIPConfig(algorithm_config, transformers_config)
-        elif isinstance(algorithm_config, DIPConfig):
-            self.config = algorithm_config
-        else:
-            raise TypeError("algorithm_config must be either a path string or a DIPConfig instance")
-
-        self.utils = DIPUtils(self.config)
-        self.logits_processor = DIPLogitsProcessor(self.config, self.utils)
-
-    def generate(self, prompt: str, *args, **kwargs) -> str:
-        """Generate watermarked text."""
-
-        # Set the state indicator to 0 for generation
+    @torch.no_grad()
+    def generate(
+        self,
+        model: torch.nn.Module,
+        inputs: dict,
+        max_new_tokens: int,
+    ) -> torch.Tensor:
         self.utils.state_indicator = 0
-
-        # Configure generate_with_watermark
         generate_with_watermark = partial(
-            self.config.generation_model.generate,
+            model.generate,
             logits_processor=LogitsProcessorList([self.logits_processor]),
-            **self.config.gen_kwargs
+            max_new_tokens=max_new_tokens,
         )
-
-        # Encode prompt
-        encoded_prompt = self.config.generation_tokenizer(prompt, return_tensors="pt", add_special_tokens=True).to(self.config.device)
-        # Generate watermarked text
-        encoded_watermarked_text = generate_with_watermark(**encoded_prompt)
-        # Decode
-        watermarked_text = self.config.generation_tokenizer.batch_decode(encoded_watermarked_text, skip_special_tokens=True)[0]
-        # Clear the history
+        outputs = generate_with_watermark(**inputs)
         self.utils.cc_history.clear()
-        return watermarked_text
+        return outputs
 
-    def p_value(self, text: str, *args, **kwargs):
-        """Detect watermark in the text."""
-
-        # Set the state indicator to 1 for detection
+    def test_statistic(self, token_ids: torch.Tensor) -> float:
         self.utils.state_indicator = 1
-
-        encoded_text = self.config.generation_tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0].to(self.config.device)
-
-        # Compute z-score using a utility method
-        z_score, _ = self.utils.score_sequence(encoded_text)
-
-        # Determine if the z-score indicates a watermark
-        is_watermarked = z_score > self.config.z_threshold
-
-        # Clear the history
+        z_score, _ = self.utils.score_sequence(token_ids.to(self.config.device))
         self.utils.cc_history.clear()
+        return z_score
 
-        # Return results based on the return_dict flag
-        if return_dict:
-            return {"is_watermarked": is_watermarked, "score": z_score}
-        else:
-            return (is_watermarked, z_score)
+    def p_value(self, token_ids: torch.Tensor, **kwargs) -> float:
+        z_score = self.test_statistic(token_ids)
+        return 0.5 * math.erfc(z_score / math.sqrt(2))
+
+
+class DIP(DipWatermarker):
+    pass

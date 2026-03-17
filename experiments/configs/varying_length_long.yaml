@@ -1,0 +1,10 @@
+name: varying_length_long
+common:
+  seed: 42
+  device: '0'
+  dataset_size: 200
+  evaluate_scores: true
+  max_lengths: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
+parameters:
+- model_name: meta-llama/Llama-3.2-3B
+- model_name: mistralai/Mistral-7B-v0.3

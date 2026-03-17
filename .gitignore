@@ -8,4 +8,6 @@ test/
 experiments/results/
 experiments/figures/
 experiments/output/
+artifacts/
+*.egg-info/
 visualize.ipynb

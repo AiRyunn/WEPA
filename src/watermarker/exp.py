@@ -28,6 +28,28 @@ def _distance_edit_jit(token_ids: np.ndarray, cost: np.ndarray, gamma: float) ->
     return f0[lam]
 
 
+@numba.njit(fastmath=True, cache=True)
+def _test_statistic_jit(
+    token_ids: np.ndarray,
+    cost: np.ndarray,
+    block_size: int,
+    gamma: float,
+) -> float:
+    lam = cost.shape[0]
+    n_windows = token_ids.shape[0] - block_size + 1
+    min_distance = np.inf
+
+    for i in range(n_windows):
+        token_block = token_ids[i : i + block_size]
+        for j in range(lam):
+            cost_shifted = cost[j : j + block_size, :]
+            distance = _distance_edit_jit(token_block, cost_shifted, gamma)
+            if distance < min_distance:
+                min_distance = distance
+
+    return float(min_distance)
+
+
 class ExpWatermarker:
     def __init__(
         self,
@@ -104,21 +126,8 @@ class ExpWatermarker:
             float: Test statistic score.
         """
         token_ids_np = token_ids.cpu().numpy()
-
-        lam = self.cost.shape[0]
-
         block_size = min(self.block_size, len(token_ids_np))
-        distances = np.zeros((len(token_ids_np) - block_size + 1, lam))
-
-        for i in range(len(token_ids_np) - block_size + 1):
-            for j in range(lam):
-                cost_shifted = self.cost[j : j + block_size, :]
-                distance = _distance_edit_jit(
-                    token_ids_np[i : i + block_size], cost_shifted, self.gamma
-                )
-                distances[i, j] = distance
-
-        return np.min(distances).item()
+        return _test_statistic_jit(token_ids_np, self.cost, block_size, self.gamma)
 
     def z_score(self, token_ids: torch.Tensor, n_samples: int = 20) -> float:
         """
